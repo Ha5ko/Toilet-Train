@@ -107,15 +107,15 @@ static bool parseService(JsonObject serviceJson, TrainService& service) {
     service.estimatedDeparture = serviceJson["etd"].as<String>();
 
     // Some services might not have arrival times (terminates here)
-    if (serviceJson.containsKey("sta")) {
+    if (!serviceJson["sta"].isNull()) {
         service.scheduledArrival = serviceJson["sta"].as<String>();
     }
-    if (serviceJson.containsKey("eta")) {
+    if (!serviceJson["eta"].isNull()) {
         service.estimatedArrival = serviceJson["eta"].as<String>();
     }
 
     // Platform
-    if (serviceJson.containsKey("platform") && !serviceJson["platform"].isNull()) {
+    if (!serviceJson["platform"].isNull()) {
         service.platform = serviceJson["platform"].as<String>();
     } else {
         service.platform = "-";
@@ -132,10 +132,10 @@ static bool parseService(JsonObject serviceJson, TrainService& service) {
     service.isCancelled = service.estimatedDeparture.equalsIgnoreCase("Cancelled");
 
     // Cancel/delay reasons
-    if (serviceJson.containsKey("cancelReason") && !serviceJson["cancelReason"].isNull()) {
+    if (!serviceJson["cancelReason"].isNull()) {
         service.cancelReason = serviceJson["cancelReason"].as<String>();
     }
-    if (serviceJson.containsKey("delayReason") && !serviceJson["delayReason"].isNull()) {
+    if (!serviceJson["delayReason"].isNull()) {
         service.delayReason = serviceJson["delayReason"].as<String>();
     }
 
@@ -147,7 +147,7 @@ static bool parseService(JsonObject serviceJson, TrainService& service) {
 
     // Parse calling points (subsequent stops)
     service.callingPoints.clear();
-    if (serviceJson.containsKey("subsequentCallingPoints")) {
+    if (!serviceJson["subsequentCallingPoints"].isNull()) {
         JsonArray callingPointLists = serviceJson["subsequentCallingPoints"]["callingPointList"];
         if (callingPointLists.size() > 0) {
             JsonArray callingPoints = callingPointLists[0]["callingPoint"];
@@ -201,7 +201,7 @@ static bool fetchDepartures(const char* originCRS, const char* destCRS, Departur
     DEBUG_PRINTF("Response size: %d bytes\n", payload.length());
 
     // Parse JSON
-    DynamicJsonDocument doc(32768);  // 32KB should be enough
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
 
     if (error) {
@@ -212,7 +212,7 @@ static bool fetchDepartures(const char* originCRS, const char* destCRS, Departur
     }
 
     // Check for API errors
-    if (doc.containsKey("error")) {
+    if (!doc["error"].isNull()) {
         String apiError = doc["error"].as<String>();
         DEBUG_PRINTF("API error: %s\n", apiError.c_str());
         board.hasData = false;
@@ -229,7 +229,7 @@ static bool fetchDepartures(const char* originCRS, const char* destCRS, Departur
     board.services.clear();
 
     // Parse services
-    if (doc.containsKey("trainServices") && !doc["trainServices"].isNull()) {
+    if (!doc["trainServices"].isNull()) {
         JsonArray services = doc["trainServices"].as<JsonArray>();
         for (JsonObject serviceJson : services) {
             TrainService service;
