@@ -1,6 +1,14 @@
 /**
  * Display Driver Implementation for ESP32-4848S040
  * 4" 480x480 ST7701 RGB LCD with GT911 Touch
+ *
+ * CRITICAL: This board requires BOTH a 9-bit SPI bus (for ST7701 register
+ * configuration) AND a 16-bit RGB parallel bus (for pixel data).
+ * The ST7701 init commands are sent via SPI, then the RGB interface takes over.
+ *
+ * Pin mapping verified against manufacturer schematics and community sources:
+ * - https://github.com/moononournation/Arduino_GFX/issues/465
+ * - https://devices.esphome.io/devices/guition-esp32-s3-4848s040/
  */
 
 #include "display.h"
@@ -10,53 +18,61 @@
 
 // =============================================================================
 // PIN DEFINITIONS for ESP32-4848S040
+// Verified against manufacturer schematic and community-tested configurations
 // =============================================================================
 
-// ST7701 LCD pins (RGB interface)
-#define LCD_DE    40
-#define LCD_VSYNC 41
-#define LCD_HSYNC 42
-#define LCD_PCLK  39
+// ST7701 SPI bus pins (9-bit SPI for register configuration)
+#define LCD_SPI_CS   39
+#define LCD_SPI_SCK  48
+#define LCD_SPI_MOSI 47
 
-// RGB data pins (directly from ESP32-S3 LCD peripheral)
-#define LCD_R0 45
-#define LCD_R1 48
-#define LCD_R2 47
-#define LCD_R3 21
-#define LCD_R4 14
+// RGB parallel interface control pins
+#define LCD_DE    18
+#define LCD_VSYNC 17
+#define LCD_HSYNC 16
+#define LCD_PCLK  21
 
-#define LCD_G0 5
-#define LCD_G1 6
-#define LCD_G2 7
-#define LCD_G3 15
-#define LCD_G4 16
-#define LCD_G5 4
+// RGB data pins - 16-bit (R5 + G6 + B5)
+// Red channel (5 bits)
+#define LCD_R0 11
+#define LCD_R1 12
+#define LCD_R2 13
+#define LCD_R3 14
+#define LCD_R4 0
 
-#define LCD_B0 8
-#define LCD_B1 3
-#define LCD_B2 46
-#define LCD_B3 9
-#define LCD_B4 1
+// Green channel (6 bits)
+#define LCD_G0 8
+#define LCD_G1 20
+#define LCD_G2 3
+#define LCD_G3 46
+#define LCD_G4 9
+#define LCD_G5 10
 
-// Backlight
+// Blue channel (5 bits)
+#define LCD_B0 4
+#define LCD_B1 5
+#define LCD_B2 6
+#define LCD_B3 7
+#define LCD_B4 15
+
+// Backlight control (drives boost converter enable via GPIO)
 #define LCD_BL 38
 
-// Touch I2C pins (GT911)
+// Touch I2C pins (GT911 capacitive touch controller)
 #define TOUCH_SDA 19
-#define TOUCH_SCL 20
-#define TOUCH_INT 18
-#define TOUCH_RST 38  // Shared with backlight on some variants
+#define TOUCH_SCL 45
 
 // GT911 I2C address
 #define GT911_ADDR 0x5D
 
 // =============================================================================
-// Display and LVGL buffers
+// Display and LVGL objects
 // =============================================================================
 
-// Arduino GFX setup for ST7701
-Arduino_ESP32RGBPanel* rgbpanel = nullptr;
-Arduino_RGB_Display* gfx = nullptr;
+// Arduino GFX objects
+static Arduino_DataBus* spi_bus = nullptr;
+static Arduino_ESP32RGBPanel* rgbpanel = nullptr;
+static Arduino_RGB_Display* gfx = nullptr;
 
 // LVGL display buffer
 static lv_disp_draw_buf_t draw_buf;
@@ -73,46 +89,6 @@ static lv_indev_drv_t indev_drv;
 static bool touch_pressed = false;
 static uint16_t touch_x = 0;
 static uint16_t touch_y = 0;
-
-// =============================================================================
-// ST7701 Initialization Sequence
-// =============================================================================
-
-// ST7701 init commands for ESP32-4848S040
-static const uint8_t st7701_init_cmd[] = {
-    0xFF, 5, 0x77, 0x01, 0x00, 0x00, 0x10,
-    0xC0, 2, 0x3B, 0x00,
-    0xC1, 2, 0x0D, 0x02,
-    0xC2, 2, 0x31, 0x05,
-    0xCD, 1, 0x00,
-    0xB0, 16, 0x00, 0x11, 0x18, 0x0E, 0x11, 0x06, 0x07, 0x08, 0x07, 0x22, 0x04, 0x12, 0x0F, 0xAA, 0x31, 0x18,
-    0xB1, 16, 0x00, 0x11, 0x19, 0x0E, 0x12, 0x07, 0x08, 0x08, 0x08, 0x22, 0x04, 0x11, 0x11, 0xA9, 0x32, 0x18,
-    0xFF, 5, 0x77, 0x01, 0x00, 0x00, 0x11,
-    0xB0, 1, 0x60,
-    0xB1, 1, 0x32,
-    0xB2, 1, 0x07,
-    0xB3, 1, 0x80,
-    0xB5, 1, 0x49,
-    0xB7, 1, 0x85,
-    0xB8, 1, 0x21,
-    0xC1, 1, 0x78,
-    0xC2, 1, 0x78,
-    0xE0, 3, 0x00, 0x1B, 0x02,
-    0xE1, 11, 0x08, 0xA0, 0x00, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x00, 0x44, 0x44,
-    0xE2, 12, 0x11, 0x11, 0x44, 0x44, 0xED, 0xA0, 0x00, 0x00, 0xEC, 0xA0, 0x00, 0x00,
-    0xE3, 4, 0x00, 0x00, 0x11, 0x11,
-    0xE4, 2, 0x44, 0x44,
-    0xE5, 16, 0x0A, 0xE9, 0xD8, 0xA0, 0x0C, 0xEB, 0xD8, 0xA0, 0x0E, 0xED, 0xD8, 0xA0, 0x10, 0xEF, 0xD8, 0xA0,
-    0xE6, 4, 0x00, 0x00, 0x11, 0x11,
-    0xE7, 2, 0x44, 0x44,
-    0xE8, 16, 0x09, 0xE8, 0xD8, 0xA0, 0x0B, 0xEA, 0xD8, 0xA0, 0x0D, 0xEC, 0xD8, 0xA0, 0x0F, 0xEE, 0xD8, 0xA0,
-    0xEB, 7, 0x02, 0x00, 0xE4, 0xE4, 0x88, 0x00, 0x40,
-    0xEC, 2, 0x3C, 0x00,
-    0xED, 16, 0xAB, 0x89, 0x76, 0x54, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x45, 0x67, 0x98, 0xBA,
-    0xFF, 5, 0x77, 0x01, 0x00, 0x00, 0x00,
-    0x11, 0,  // Sleep out
-    0xFF, 0xFF  // End marker
-};
 
 // =============================================================================
 // LVGL Flush Callback
@@ -199,44 +175,65 @@ static void lvgl_touch_cb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
 bool display_init() {
     DEBUG_PRINTLN("Initializing display...");
 
-    // Initialize backlight
+    // Initialize backlight pin - start OFF
     pinMode(LCD_BL, OUTPUT);
+    digitalWrite(LCD_BL, LOW);
+
+    // Set up PWM for backlight dimming
     ledcSetup(BACKLIGHT_CHANNEL, BACKLIGHT_FREQ, BACKLIGHT_RESOLUTION);
     ledcAttachPin(LCD_BL, BACKLIGHT_CHANNEL);
-    ledcWrite(BACKLIGHT_CHANNEL, 0);  // Start with backlight off
+    ledcWrite(BACKLIGHT_CHANNEL, 0);
 
-    // Initialize I2C for touch
+    // Initialize I2C for touch (SDA=19, SCL=45 per schematic)
     Wire.begin(TOUCH_SDA, TOUCH_SCL);
     Wire.setClock(400000);
 
-    // Initialize RGB panel
+    // =========================================================================
+    // Create SPI bus for ST7701 register initialization.
+    // The ST7701 requires a 9-bit SPI interface to receive its init commands.
+    // Without this bus, the display controller never leaves sleep mode and
+    // the screen stays completely blank!
+    // =========================================================================
+    spi_bus = new Arduino_SWSPI(
+        GFX_NOT_DEFINED, // DC - not used in 9-bit SPI mode
+        LCD_SPI_CS,      // CS  = GPIO 39
+        LCD_SPI_SCK,     // SCK = GPIO 48
+        LCD_SPI_MOSI,    // MOSI = GPIO 47
+        GFX_NOT_DEFINED  // MISO - not used
+    );
+
+    // =========================================================================
+    // Create RGB panel with correct pin mapping and timing parameters.
+    // These values are verified from community-tested configurations.
+    // =========================================================================
     rgbpanel = new Arduino_ESP32RGBPanel(
         LCD_DE, LCD_VSYNC, LCD_HSYNC, LCD_PCLK,
         LCD_R0, LCD_R1, LCD_R2, LCD_R3, LCD_R4,
         LCD_G0, LCD_G1, LCD_G2, LCD_G3, LCD_G4, LCD_G5,
         LCD_B0, LCD_B1, LCD_B2, LCD_B3, LCD_B4,
-        0,    // hsync_polarity
-        8,    // hsync_front_porch
-        4,    // hsync_pulse_width
-        8,    // hsync_back_porch
-        0,    // vsync_polarity
-        8,    // vsync_front_porch
-        4,    // vsync_pulse_width
-        8,    // vsync_back_porch
-        1,    // pclk_active_neg
-        16000000  // prefer_speed
+        1,    // hsync_polarity (active high)
+        10,   // hsync_front_porch
+        8,    // hsync_pulse_width
+        50,   // hsync_back_porch
+        1,    // vsync_polarity (active high)
+        10,   // vsync_front_porch
+        8,    // vsync_pulse_width
+        20    // vsync_back_porch
     );
 
-    // Initialize GFX display
+    // =========================================================================
+    // Create display driver. The SPI bus sends ST7701 register configuration,
+    // then the RGB panel takes over for pixel data.
+    // =========================================================================
     gfx = new Arduino_RGB_Display(
         SCREEN_WIDTH, SCREEN_HEIGHT,
         rgbpanel,
-        0,     // rotation
-        true,  // auto_flush
-        nullptr,  // bus (not used for RGB)
-        -1,    // rst
-        st7701_init_cmd,
-        sizeof(st7701_init_cmd)
+        0,                // rotation
+        true,             // auto_flush
+        spi_bus,          // SPI bus for ST7701 init (was nullptr - CRITICAL FIX)
+        GFX_NOT_DEFINED,  // RST (handled by hardware power-on reset circuit)
+        st7701_type8_init_operations,
+        sizeof(st7701_type8_init_operations)
     );
 
     if (!gfx->begin()) {
@@ -257,10 +254,16 @@ bool display_init() {
     buf2 = (lv_color_t*)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
 
     if (!buf1 || !buf2) {
-        DEBUG_PRINTLN("Failed to allocate display buffers!");
+        DEBUG_PRINTLN("Failed to allocate display buffers in PSRAM!");
         // Try without PSRAM
+        if (buf1) free(buf1);
+        if (buf2) free(buf2);
         buf1 = (lv_color_t*)malloc(buf_size * sizeof(lv_color_t));
         buf2 = nullptr;
+        if (!buf1) {
+            DEBUG_PRINTLN("Failed to allocate any display buffer!");
+            return false;
+        }
     }
 
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buf_size);
